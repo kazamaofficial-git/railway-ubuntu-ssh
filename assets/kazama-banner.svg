@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="t d">
+  <title id="t">Kazama — Railway Ubuntu SSH</title>
+  <desc id="d">Kazama banner: Ubuntu 26.04 SSH workstation for Railway</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#150d2b"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.55" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#d946ef"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.85" cy="0.1" r="0.7">
+      <stop offset="0" stop-color="#6366f1" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="360" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="360" rx="24" fill="url(#glow)"/>
+
+  <!-- terminal card -->
+  <g transform="translate(790 52)">
+    <rect width="430" height="256" rx="14" fill="#0a0f1d" stroke="#2a3350" stroke-width="1.5"/>
+    <circle cx="24" cy="24" r="6" fill="#ff5f57"/>
+    <circle cx="44" cy="24" r="6" fill="#febc2e"/>
+    <circle cx="64" cy="24" r="6" fill="#28c840"/>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">
+      <text x="24" y="68"  fill="#94a3b8">$ ssh root@your-app.proxy.rlwy.net -p 22</text>
+      <text x="24" y="100" fill="#e2e8f0">Welcome to Ubuntu 26.04 LTS</text>
+      <text x="24" y="136" fill="#22d3ee">✔ OpenSSH server</text>
+      <text x="24" y="162" fill="#22d3ee">✔ Dev toolkit (git, node, python)</text>
+      <text x="24" y="188" fill="#22d3ee">✔ English · Bahasa Indonesia</text>
+      <text x="24" y="214" fill="#22d3ee">✔ GitHub auto-backup for /root/src</text>
+      <text x="24" y="242" fill="#e2e8f0">root@kazama:~# <tspan fill="#d946ef">▋</tspan></text>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="Inter, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+    <text x="72" y="168" font-size="118" font-weight="800" letter-spacing="4" fill="url(#brand)">KAZAMA</text>
+    <rect x="76" y="192" width="120" height="6" rx="3" fill="url(#brand)"/>
+    <text x="76" y="244" font-size="30" font-weight="600" fill="#e2e8f0">Railway Ubuntu SSH Server</text>
+    <text x="76" y="284" font-size="20" fill="#94a3b8">Ubuntu 26.04 LTS · Cloud workstation · @kazamaofficial-git</text>
+  </g>
+</svg>
