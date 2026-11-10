@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ============================================================
+# Kazama — Railway Usage Monitor (command: usage)
+# Developer  : @kazamaofficial-git
+# Repository : https://github.com/kazamaofficial-git/railway-ubuntu-ssh
+# ============================================================
+# Shows the remaining Railway trial credit and how much uptime is
+# left, based on this container's allocated resources and runtime.
+#
+# Modes
+#   ESTIMATE  (default)       burn computed from cgroup CPU/RAM + runtime
+#   LIVE      (RAILWAY_TOKEN) additionally reads real credit from the
+#                             Railway GraphQL API (account token required)
+#
+# Rates (overridable):
+#   RAILWAY_TRIAL_CREDIT   total trial credit in $          (5.00)
+#   RAILWAY_VCPU_RATE      $ per vCPU-hour                  (0.02778)
+#   RAILWAY_MEM_RATE       $ per GB-hour                    (0.01386)
+#   RAILWAY_EGRESS_RATE    $ per GB egress                  (0.05)
+#
+# Manual overrides (handy for testing / custom allocation):
+#   USAGE_CPU  USAGE_MEM_GB  USAGE_EGRESS_GB  USAGE_ELAPSED_SEC
+set -uo pipefail
+
+# shellcheck source=../lib/kazama/common.sh
+. /usr/local/lib/kazama/common.sh
+kz_init_colors
+
+readonly API_URL="https://backboard.railway.com/graphql/v2"
+readonly TRIAL="${RAILWAY_TRIAL_CREDIT:-5.00}"
+readonly VCPU_RATE="${RAILWAY_VCPU_RATE:-0.02778}"
+readonly MEM_RATE="${RAILWAY_MEM_RATE:-0.01386}"
+readonly EGRESS_RATE="${RAILWAY_EGRESS_RATE:-0.05}"
+readonly BAR_WIDTH=30
+readonly RULE="──────────────────────────────────────────────────────"
+
+# Helpers ----------------------------------------------------------------
+fmt() { awk -v v="$2" "BEGIN { printf \"$1\", v }"; } # fmt FORMAT VALUE (locale-safe)
+is_positive() { awk -v n="$1" 'BEGIN { exit !(n > 0) }'; }
+pick_value() { if [[ -n $1 ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; } # OVERRIDE DETECTED
+
+# ---------------------------------------------------------------
+# Live data (optional)
+# ---------------------------------------------------------------
+LIVE_CREDITS=''
+LIVE_BALANCE=''
+
+fetch_live_credit() {
+  local token response
+  token="$(kz_secret RAILWAY_TOKEN railway-token)"
+  [[ -n $token ]] || return 0
+
+  response="$(curl -s --max-time 12 -X POST "$API_URL" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -d '{"query":"{ me { billingDetails { availableCredits currentBalance } } }"}' 2>/dev/null)" || return 0
+
+  LIVE_CREDITS="$(jq -r '.data.me.billingDetails.availableCredits // empty' <<<"$response" 2>/dev/null)"
+  LIVE_BALANCE="$(jq -r '.data.me.billingDetails.currentBalance // empty' <<<"$response" 2>/dev/null)"
+}
+
+# ---------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------
+row() { # row LABEL VALUE
+  printf '  %s%-15s%s %s│%s %s\n' "$C_BLUE" "$1" "$C_RESET" "$C_GREY" "$C_RESET" "$2"
+}
+
+progress_bar() { # progress_bar PERCENT
+  local pct=$1 filled=$(($1 * BAR_WIDTH / 100)) color=$C_GREEN i
+  ((pct >= 70)) && color=$C_YELLOW
+  ((pct >= 90)) && color=$C_RED
+  printf '%s[%s' "$C_GREY" "$C_RESET"
+  for ((i = 1; i <= BAR_WIDTH; i++)); do
+    if ((i <= filled)); then
+      printf '%s%s█%s' "$color" "$C_BOLD" "$C_RESET"
+    else
+      printf '%s░%s' "$C_GREY" "$C_RESET"
+    fi
+  done
+  printf '%s]%s %d%%' "$C_GREY" "$C_RESET" "$pct"
+}
+
+main() {
+  # --- inputs -----------------------------------------------------------
+  local cpu mem egress age
+  cpu="$(pick_value "${USAGE_CPU:-}" "$(kz_cpu_count)")"
+  mem="$(pick_value "${USAGE_MEM_GB:-}" "$(kz_mem_gb)")"
+  egress="$(pick_value "${USAGE_EGRESS_GB:-}" "$(kz_egress_gb)")"
+  age="$(pick_value "${USAGE_ELAPSED_SEC:-}" "$(kz_deploy_age)")"
+
+  # --- maths (single awk call, values passed with -v) -------------------
+  local burn_per_hour used remaining uptime_left_h trial_days pct
+  read -r burn_per_hour used remaining uptime_left_h trial_days pct < <(
+    awk -v cpu="$cpu" -v mem="$mem" -v egress="$egress" -v age="$age" \
+      -v trial="$TRIAL" -v vr="$VCPU_RATE" -v mr="$MEM_RATE" -v er="$EGRESS_RATE" '
+      BEGIN {
+        burn = cpu * vr + mem * mr
+        used = burn * (age / 3600) + egress * er
+        rem  = trial - used
+        left = (rem > 0 && burn > 0) ? rem / burn : 0
+        days = (burn > 0) ? trial / burn / 24 : 0
+        pct  = (trial > 0) ? int(used / trial * 100) : 100
+        if (pct > 100) pct = 100
+        printf "%.6f %.4f %.4f %.2f %.1f %d\n", burn, used, rem, left, days, pct
+      }'
+  )
+
+  fetch_live_credit
+  local mode="${C_YELLOW}ESTIMATE${C_RESET} ${C_GREY}$(msg '(no RAILWAY_TOKEN)' '(tanpa RAILWAY_TOKEN)')${C_RESET}"
+  if [[ -n $LIVE_CREDITS && $LIVE_CREDITS != null ]]; then
+    mode="${C_GREEN}LIVE${C_RESET} ${C_GREY}(Railway API)${C_RESET}"
+  fi
+
+  # --- output -----------------------------------------------------------
+  printf '\n'
+  printf '  %s%sKazama%s %s·%s %s%s%s\n' \
+    "$C_CYAN" "$C_BOLD" "$C_RESET" "$C_GREY" "$C_RESET" \
+    "$C_WHITE" "$(msg 'Railway Usage Monitor' 'Monitor Penggunaan Railway')" "$C_RESET"
+  printf '  %s%s%s\n' "$C_GREY" "$RULE" "$C_RESET"
+
+  row "Mode" "$mode"
+  row "$(msg 'Trial credit' 'Kredit trial')" "${C_WHITE}${C_BOLD}\$$(fmt %.2f "$TRIAL")${C_RESET}"
+  row "$(msg 'Resources' 'Resource')" \
+    "${C_WHITE}$(fmt %.2f "$cpu") vCPU${C_RESET} ${C_GREY}+${C_RESET} ${C_WHITE}$(fmt %.2f "$mem") GB RAM${C_RESET} ${C_GREY}(egress ≈ $(fmt %.3f "$egress") GB)${C_RESET}"
+  row "Runtime" "${C_WHITE}$(kz_fmt_duration "$age")${C_RESET}"
+  row "$(msg 'Burn rate' 'Laju pemakaian')" "${C_YELLOW}\$${burn_per_hour} / $(msg 'hr' 'jam')${C_RESET}"
+  row "$(msg 'Trial lasts' 'Trial tahan')" \
+    "${C_CYAN}${C_BOLD}${trial_days} $(msg 'days' 'hari')${C_RESET} ${C_GREY}$(msg '@ current burn' '@ laju saat ini')${C_RESET}"
+  row "$(msg 'Used' 'Terpakai')" "${C_YELLOW}\$$(fmt %.2f "$used")${C_RESET}  $(progress_bar "$pct")"
+
+  if is_positive "$remaining"; then
+    row "$(msg 'Remaining' 'Sisa')" "${C_GREEN}${C_BOLD}\$$(fmt %.2f "$remaining")${C_RESET}"
+  else
+    row "$(msg 'Remaining' 'Sisa')" \
+      "${C_RED}${C_BOLD}\$0.00 $(msg '(credit exhausted — service will sleep)' '(kredit habis — layanan akan tidur)')${C_RESET}"
+  fi
+
+  if [[ -n $LIVE_CREDITS && $LIVE_CREDITS != null ]]; then
+    row "API credits" "${C_GREEN}\$$(fmt %.2f "$LIVE_CREDITS")${C_RESET} ${C_GREY}(availableCredits)${C_RESET}"
+    if [[ -n $LIVE_BALANCE && $LIVE_BALANCE != null ]]; then
+      row "API balance" "${C_WHITE}\$$(fmt %.2f "$LIVE_BALANCE")${C_RESET}"
+    fi
+  fi
+
+  row "$(msg 'Uptime left' 'Sisa uptime')" \
+    "${C_CYAN}${C_BOLD}$(kz_fmt_duration "$(awk -v h="$uptime_left_h" 'BEGIN { printf "%d", h * 3600 }')")${C_RESET} ${C_GREY}$(msg '(at current burn)' '(pada laju saat ini)')${C_RESET}"
+
+  printf '  %s%s%s\n' "$C_GREY" "$RULE" "$C_RESET"
+  printf '  %sTip:%s %s\n' "$C_GREY" "$C_RESET" \
+    "$(msg \
+      "set RAILWAY_TOKEN (account token) in Railway Variables for exact live credit." \
+      "isi RAILWAY_TOKEN (account token) di Railway Variables untuk kredit live yang akurat.")"
+  printf '     %s%s%s\n\n' "$C_GREY" \
+    "$(msg 'override allocation: USAGE_CPU / USAGE_MEM_GB' 'ubah alokasi: USAGE_CPU / USAGE_MEM_GB')" "$C_RESET"
+}
+
+main "$@"
