@@ -1,0 +1,13 @@
+.git
+.github
+.gitattributes
+.gitignore
+.dockerignore
+assets
+docs
+*.md
+LICENSE
+railway.json
+railway-template.json
+.DS_Store
+scripts
