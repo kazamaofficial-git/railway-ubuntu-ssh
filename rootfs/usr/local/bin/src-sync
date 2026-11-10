@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# ============================================================
+# Kazama — src-sync (backup + restore of /root/src via GitHub)
+# Developer  : @kazamaofficial-git
+# Repository : https://github.com/kazamaofficial-git/railway-ubuntu-ssh
+# ============================================================
+# Keeps /root/src backed up to a PRIVATE GitHub repository
+# (default name: kazama-src-<railway-project-id>) so your work
+# survives Railway container rebuilds.
+#
+#   src-sync [backup]   push local changes now (default)
+#   src-sync restore    pull the repository into /root/src
+#   src-sync init       create / link the private repository
+#   src-sync watch      push every SYNC_INTERVAL seconds (default 180)
+#   src-sync status     show the linked repository + last commit
+#
+# Every command also accepts a leading "--" (e.g. --restore).
+#
+# Environment:
+#   GITHUB_TOKEN        required — token with `repo` scope
+#   SYNC_INTERVAL       seconds between automatic syncs (default 180, min 30)
+#   SRC_REPO            pin a specific repository name (e.g. to restore
+#                       into a brand-new Railway project)
+#   GITHUB_SYNC_NAME / GITHUB_SYNC_EMAIL   commit author
+set -uo pipefail
+
+# shellcheck source=../lib/kazama/common.sh
+. /usr/local/lib/kazama/common.sh
+
+readonly GITHUB_API="${KZ_GITHUB_API:-https://api.github.com}"
+readonly GIT_BASE="${KZ_GIT_BASE:-https://github.com}"
+readonly REPO_PREFIX="kazama-src-"
+readonly MARK_FILE="$KZ_STATE_DIR/src-repo"
+readonly LOCK_FILE="${KZ_LOCK_FILE:-/var/lock/kazama-src-sync.lock}"
+readonly COMMIT_NAME="${GITHUB_SYNC_NAME:-Kazama Sync}"
+readonly COMMIT_EMAIL="${GITHUB_SYNC_EMAIL:-kazama-sync@users.noreply.github.com}"
+
+TOKEN="$(kz_secret GITHUB_TOKEN github-token)"
+INTERVAL="${SYNC_INTERVAL:-180}"
+if [[ ! $INTERVAL =~ ^[0-9]+$ ]] || ((INTERVAL < 30)); then
+  INTERVAL=180
+fi
+QUIET=0
+
+export GIT_TERMINAL_PROMPT=0
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+
+need_token() {
+  [[ -n $TOKEN ]] || kz_die \
+    "GITHUB_TOKEN not set — cannot sync $KZ_SRC_DIR" \
+    "GITHUB_TOKEN belum diatur — tidak bisa sinkronisasi $KZ_SRC_DIR"
+}
+
+# git against /root/src. Credentials are passed per command through an HTTP
+# header, so the token is never written to .git/config nor to the remote URL.
+git_src() {
+  local auth
+  auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+  git -C "$KZ_SRC_DIR" \
+    -c user.name="$COMMIT_NAME" \
+    -c user.email="$COMMIT_EMAIL" \
+    -c credential.helper= \
+    -c "http.extraHeader=Authorization: Basic $auth" \
+    "$@"
+}
+
+gh_curl() {
+  curl -sS --max-time 20 \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$@"
+}
+
+github_user() {
+  gh_curl "$GITHUB_API/user" | jq -r '.login // empty'
+}
+
+repo_exists() { # repo_exists OWNER NAME
+  [[ "$(gh_curl -o /dev/null -w '%{http_code}' "$GITHUB_API/repos/$1/$2")" == 200 ]]
+}
+
+create_repo() { # create_repo NAME
+  local body
+  body="$(jq -nc --arg n "$1" \
+    '{name: $n, description: "Kazama cloud workspace — auto-synced src folder", private: true, auto_init: false}')"
+  [[ "$(gh_curl -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' -d "$body" "$GITHUB_API/user/repos")" == 201 ]]
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9' '-' \
+    | sed -E 's/-+/-/g; s/^-//' \
+    | cut -c1-40 \
+    | sed -E 's/-+$//'
+}
+
+# Repository name: explicit SRC_REPO > remembered > derived from the project id.
+repo_name() {
+  if [[ -n ${SRC_REPO:-} ]]; then
+    printf '%s' "$SRC_REPO"
+  elif [[ -s $MARK_FILE ]]; then
+    printf '%s' "$(<"$MARK_FILE")"
+  else
+    printf '%s%s' "$REPO_PREFIX" "$(slugify "${RAILWAY_PROJECT_ID:-$(hostname)}")"
+  fi
+}
+
+# Resolve GitHub owner + repository name into USER_NAME / REPO_NAME.
+resolve_target() {
+  USER_NAME="$(github_user)" && [[ -n $USER_NAME ]] || {
+    kz_err \
+      "Cannot read the GitHub user — check GITHUB_TOKEN" \
+      "Tidak bisa membaca user GitHub — periksa GITHUB_TOKEN"
+    return 1
+  }
+  REPO_NAME="$(repo_name)"
+  if [[ ! $REPO_NAME =~ ^[A-Za-z0-9._-]+$ ]]; then
+    kz_err "Invalid repository name: $REPO_NAME" "Nama repository tidak valid: $REPO_NAME"
+    return 1
+  fi
+}
+
+link_repo() { # uses USER_NAME / REPO_NAME
+  local url="$GIT_BASE/$USER_NAME/$REPO_NAME.git"
+  mkdir -p "$KZ_SRC_DIR" "$KZ_STATE_DIR"
+  [[ -d $KZ_SRC_DIR/.git ]] || git -C "$KZ_SRC_DIR" init -q -b main
+  if git -C "$KZ_SRC_DIR" remote get-url origin &>/dev/null; then
+    git -C "$KZ_SRC_DIR" remote set-url origin "$url"
+  else
+    git -C "$KZ_SRC_DIR" remote add origin "$url"
+  fi
+  printf '%s' "$REPO_NAME" >"$MARK_FILE"
+}
+
+remote_has_main() {
+  git_src ls-remote --exit-code --heads origin main &>/dev/null
+}
+
+# Sensible defaults so heavy/generated folders never hit GitHub's size limits.
+ensure_gitignore() {
+  local file="$KZ_SRC_DIR/.gitignore"
+  [[ -e $file ]] && return 0
+  cat >"$file" <<'EOF'
+# Added by Kazama src-sync — edit freely.
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.cache/
+*.log
+.DS_Store
+EOF
+}
+
+say() { # say "en" "id" — suppressed in quiet (watch) mode
+  [[ $QUIET == 1 ]] || kz_info "$1" "$2"
+}
+
+# ---------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------
+
+do_init() {
+  need_token
+  resolve_target || return 1
+  if repo_exists "$USER_NAME" "$REPO_NAME"; then
+    kz_info \
+      "Repository $USER_NAME/$REPO_NAME already exists" \
+      "Repository $USER_NAME/$REPO_NAME sudah ada"
+  elif create_repo "$REPO_NAME"; then
+    kz_info \
+      "Created private repository $USER_NAME/$REPO_NAME" \
+      "Repository privat $USER_NAME/$REPO_NAME berhasil dibuat"
+  else
+    kz_err \
+      "Failed to create $USER_NAME/$REPO_NAME (token needs the 'repo' scope)" \
+      "Gagal membuat $USER_NAME/$REPO_NAME (token harus memiliki scope 'repo')"
+    return 1
+  fi
+  link_repo
+  printf '%s/%s\n' "$USER_NAME" "$REPO_NAME" # stdout: consumed by kazama-entrypoint
+}
+
+restore_into_empty_repo() {
+  # Plain checkout first; if untracked local files would be overwritten,
+  # keep a full copy next to src and force the checkout.
+  if git_src checkout -q -B main origin/main 2>/dev/null; then
+    return 0
+  fi
+  local backup
+  backup="${KZ_SRC_DIR}.pre-restore-$(date +%s)"
+  cp -a "$KZ_SRC_DIR" "$backup"
+  git_src checkout -q -f -B main origin/main || return 1
+  kz_warn \
+    "Local files conflicted with the backup; a copy was saved to $backup" \
+    "File lokal bentrok dengan backup; salinannya disimpan di $backup"
+}
+
+do_restore() {
+  need_token
+  resolve_target || return 1
+
+  if ! repo_exists "$USER_NAME" "$REPO_NAME"; then
+    kz_info \
+      "No repository $USER_NAME/$REPO_NAME yet — it will be created on the first backup" \
+      "Belum ada repository $USER_NAME/$REPO_NAME — akan dibuat saat backup pertama"
+    return 0
+  fi
+  link_repo
+
+  if ! remote_has_main; then
+    kz_info "Remote is empty — nothing to restore" "Remote masih kosong — tidak ada yang dipulihkan"
+    return 0
+  fi
+  git_src fetch -q origin main || {
+    kz_err "Fetch failed" "Fetch gagal"
+    return 1
+  }
+
+  if git_src rev-parse -q --verify HEAD &>/dev/null; then
+    # Local history already exists → integrate remote changes.
+    git_src pull --rebase --autostash -q origin main || {
+      git_src rebase --abort &>/dev/null
+      kz_err \
+        "Could not merge remote changes automatically — resolve manually in $KZ_SRC_DIR" \
+        "Perubahan remote tidak bisa digabung otomatis — selesaikan manual di $KZ_SRC_DIR"
+      return 1
+    }
+  else
+    restore_into_empty_repo || {
+      kz_err "Restore failed" "Restore gagal"
+      return 1
+    }
+  fi
+  kz_info "Restored $KZ_SRC_DIR from $USER_NAME/$REPO_NAME" "$KZ_SRC_DIR dipulihkan dari $USER_NAME/$REPO_NAME"
+}
+
+do_push() {
+  need_token
+
+  # One sync at a time (the watcher and a manual run could overlap).
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    say "Another sync is already running" "Sinkronisasi lain sedang berjalan"
+    return 0
+  fi
+
+  if [[ ! -d $KZ_SRC_DIR/.git ]] || ! git -C "$KZ_SRC_DIR" remote get-url origin &>/dev/null; then
+    do_init >/dev/null || return 1
+  fi
+
+  ensure_gitignore
+  git_src add -A
+  if git_src diff --cached --quiet; then
+    say "src: nothing to sync" "src: tidak ada perubahan untuk disinkronkan"
+    return 0
+  fi
+  git_src commit -q -m "auto-sync $(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
+
+  if remote_has_main; then
+    git_src pull --rebase --autostash -q origin main || {
+      git_src rebase --abort &>/dev/null
+      kz_err \
+        "Remote changed and could not be merged — resolve manually in $KZ_SRC_DIR" \
+        "Remote berubah dan tidak bisa digabung — selesaikan manual di $KZ_SRC_DIR"
+      return 1
+    }
+  fi
+  git_src push -q -u origin HEAD:main || {
+    kz_err "Push failed" "Push gagal"
+    return 1
+  }
+  kz_info "src backed up to GitHub" "src berhasil dicadangkan ke GitHub"
+}
+
+do_watch() {
+  need_token
+  kz_info \
+    "Watching $KZ_SRC_DIR every ${INTERVAL}s" \
+    "Memantau $KZ_SRC_DIR setiap ${INTERVAL} detik"
+  QUIET=1
+  while true; do
+    do_push || true
+    sleep "$INTERVAL"
+  done
+}
+
+do_status() {
+  need_token
+  resolve_target || return 1
+  printf 'SRC:    %s\n' "$KZ_SRC_DIR"
+  printf 'Repo:   %s/%s\n' "$USER_NAME" "$REPO_NAME"
+  printf 'Remote: %s\n' "$(git -C "$KZ_SRC_DIR" remote get-url origin 2>/dev/null || echo '(not linked)')"
+  printf 'Last:   %s\n' "$(git -C "$KZ_SRC_DIR" log -1 --format='%h %cr — %s' 2>/dev/null || echo '(no commits)')"
+}
+
+usage_text() {
+  msg \
+    "usage: src-sync [backup|restore|init|watch|status]" \
+    "penggunaan: src-sync [backup|restore|init|watch|status]"
+  printf '\n'
+}
+
+main() {
+  case "${1:-backup}" in
+    backup | push | --backup | --push) do_push ;;
+    restore | --restore) do_restore ;;
+    init | --init) do_init ;;
+    watch | --watch) do_watch ;;
+    status | --status) do_status ;;
+    -h | --help | help) usage_text ;;
+    *)
+      usage_text >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
