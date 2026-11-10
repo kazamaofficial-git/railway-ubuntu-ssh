@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint shell scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -x -s bash \
+            rootfs/usr/local/bin/* \
+            rootfs/usr/local/lib/kazama/common.sh \
+            rootfs/etc/profile.d/kazama-welcome.sh \
+            scripts/*.sh
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: kazama-ssh:ci
+      - name: Smoke test
+        run: |
+          docker run --rm --entrypoint cat kazama-ssh:ci /etc/os-release | grep -q 'VERSION_ID="26.04"'
+          docker run --rm --entrypoint bash kazama-ssh:ci -c 'command -v usage src-sync fastfetch tmux git node python3 tailscale tailscaled'
+          # The container must refuse to start without ROOT_PASSWORD.
+          if docker run --rm -e ROOT_PASSWORD= kazama-ssh:ci; then exit 1; fi
