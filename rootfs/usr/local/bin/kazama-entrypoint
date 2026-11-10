@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# ============================================================
+# Kazama — container entrypoint
+# Developer  : @kazamaofficial-git
+# Repository : https://github.com/kazamaofficial-git/railway-ubuntu-ssh
+# ============================================================
+# Runs on every container start:
+#   1. validates and sets the root password (mandatory)
+#   2. records the first-deploy time (used by `usage`)
+#   3. creates the optional sudo user
+#   4. installs optional SSH authorized keys for root
+#   5. persists runtime config for interactive SSH sessions
+#   6. optionally joins your Tailscale network (private SSH, no public TCP Proxy)
+#   7. links / restores / watches /root/src with GitHub (optional)
+#   8. hands over to sshd
+set -Eeuo pipefail
+
+# shellcheck source=../lib/kazama/common.sh
+. /usr/local/lib/kazama/common.sh
+
+readonly ROOT_HOME="${KZ_ROOT_HOME:-/root}"
+readonly SSHD_BIN="${KZ_SSHD_BIN:-/usr/sbin/sshd}"
+readonly SYNC_BIN="${KZ_SYNC_BIN:-/usr/local/bin/src-sync}"
+readonly SYNC_LOG="${KZ_SYNC_LOG:-/var/log/src-sync.log}"
+
+# ---------------------------------------------------------------
+# 1. Root password (mandatory)
+# ---------------------------------------------------------------
+configure_root_password() {
+  if [[ -z ${ROOT_PASSWORD:-} ]]; then
+    kz_die \
+      "ROOT_PASSWORD is required. Set a root password before deploying." \
+      "ROOT_PASSWORD wajib diisi. Atur password root sebelum deploy."
+  fi
+  printf 'root:%s\n' "$ROOT_PASSWORD" | chpasswd
+  kz_info \
+    "Root password set — you can now connect as root" \
+    "Password root diatur — sekarang Anda bisa login sebagai root"
+}
+
+# ---------------------------------------------------------------
+# 2. Deploy marker
+# ---------------------------------------------------------------
+record_deploy_time() {
+  install -d -m 0755 "$KZ_STATE_DIR"
+  [[ -f $KZ_STATE_DIR/deploy-start ]] || date +%s >"$KZ_STATE_DIR/deploy-start"
+}
+
+# ---------------------------------------------------------------
+# 3. Optional sudo user
+# ---------------------------------------------------------------
+configure_extra_user() {
+  local user=${SSH_USERNAME:-} pass=${SSH_PASSWORD:-}
+
+  # Neither set → feature simply not used.
+  if [[ -z $user && -z $pass ]]; then
+    return 0
+  fi
+  if [[ -z $user || -z $pass ]]; then
+    kz_warn \
+      "SSH_USERNAME and SSH_PASSWORD must be set together; skipping extra user" \
+      "SSH_USERNAME dan SSH_PASSWORD harus diisi bersamaan; user tambahan dilewati"
+    return 0
+  fi
+  if [[ ! $user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    kz_warn \
+      "SSH_USERNAME '$user' is not a valid Linux username; skipping extra user" \
+      "SSH_USERNAME '$user' bukan username Linux yang valid; user tambahan dilewati"
+    return 0
+  fi
+
+  getent group sudo >/dev/null || groupadd --system sudo
+  if id "$user" &>/dev/null; then
+    usermod -aG sudo "$user"
+    kz_info "User $user already exists" "User $user sudah ada"
+  else
+    useradd --create-home --shell /bin/bash --groups sudo "$user"
+    kz_info \
+      "User $user created and added to the sudo group" \
+      "User $user dibuat dan ditambahkan ke grup sudo"
+  fi
+  # Always (re)apply the password so changing the variable takes effect.
+  printf '%s:%s\n' "$user" "$pass" | chpasswd
+}
+
+# ---------------------------------------------------------------
+# 4. Optional authorized keys (root)
+# ---------------------------------------------------------------
+configure_authorized_keys() {
+  if [[ -z ${AUTHORIZED_KEYS:-} ]]; then
+    kz_info "Authorized keys not set" "Authorized keys tidak diatur"
+    return 0
+  fi
+  install -d -m 0700 "$ROOT_HOME/.ssh"
+  printf '%s\n' "$AUTHORIZED_KEYS" >"$ROOT_HOME/.ssh/authorized_keys"
+  chmod 0600 "$ROOT_HOME/.ssh/authorized_keys"
+  kz_info "Authorized keys set for root" "Authorized keys untuk root diatur"
+}
+
+# ---------------------------------------------------------------
+# 5. Persist runtime config for interactive SSH sessions
+# ---------------------------------------------------------------
+# sshd login shells do not inherit the container environment, so we
+# write non-secret settings to a config file and secrets to 0600 files.
+
+write_secret() { # write_secret file-name value
+  local file="$KZ_STATE_DIR/$1"
+  if [[ -n $2 ]]; then
+    install -m 0600 /dev/null "$file"
+    printf '%s' "$2" >"$file"
+  else
+    rm -f "$file" # token removed from the variables → drop the stale copy
+  fi
+}
+
+persist_runtime_config() {
+  install -d -m 0755 "$(dirname "$KZ_CONF_FILE")" "$KZ_STATE_DIR"
+  {
+    printf 'APP_LANG=%s\n' "$KZ_LANG"
+    printf 'SYNC_INTERVAL=%s\n' "${SYNC_INTERVAL:-180}"
+    if [[ -n ${SRC_REPO:-} ]]; then
+      printf 'SRC_REPO=%s\n' "$SRC_REPO"
+    fi
+    if [[ -n ${RAILWAY_PROJECT_ID:-} ]]; then
+      printf 'RAILWAY_PROJECT_ID=%s\n' "$RAILWAY_PROJECT_ID"
+    fi
+  } >"$KZ_CONF_FILE"
+  chmod 0644 "$KZ_CONF_FILE"
+
+  write_secret github-token "${GITHUB_TOKEN:-}"
+  write_secret railway-token "${RAILWAY_TOKEN:-}"
+}
+
+# ---------------------------------------------------------------
+# 6. Tailscale (optional) — private SSH without a public TCP Proxy
+# ---------------------------------------------------------------
+start_tailscale() { # start_tailscale AUTH_KEY
+  local key=$1 sock=/var/run/tailscale/tailscaled.sock host=${TAILSCALE_HOSTNAME:-kazama-ssh} ip='' i
+  install -d /var/run/tailscale
+
+  # Userspace networking: no /dev/net/tun or NET_ADMIN needed (Railway has neither).
+  tailscaled --tun=userspace-networking --state=mem: --socket="$sock" >/var/log/tailscaled.log 2>&1 &
+  for i in $(seq 1 30); do [[ -S $sock ]] && break; sleep 1; done
+
+  if ! tailscale --socket="$sock" up --authkey="$key" --hostname="$host" --accept-dns=false >/var/log/tailscale-up.log 2>&1; then
+    kz_warn \
+      "Tailscale login failed — check TAILSCALE_AUTHKEY (see /var/log/tailscale-up.log)." \
+      "Login Tailscale gagal — periksa TAILSCALE_AUTHKEY (lihat /var/log/tailscale-up.log)."
+    return 0
+  fi
+
+  # Forward tailnet port 22 to the local sshd.
+  tailscale --socket="$sock" serve --bg --tcp=22 tcp://127.0.0.1:22 >/dev/null 2>&1 || true
+  ip="$(tailscale --socket="$sock" ip -4 2>/dev/null | head -1)"
+  kz_info \
+    "Tailscale ready — ssh root@${ip}  or  ssh root@${host}  (Tailscale must run on your device)" \
+    "Tailscale siap — ssh root@${ip}  atau  ssh root@${host}  (Tailscale harus aktif di perangkat Anda)"
+}
+
+# ---------------------------------------------------------------
+# 7. src ⇄ GitHub sync (optional)
+# ---------------------------------------------------------------
+start_src_sync() {
+  install -d -m 0755 "$KZ_SRC_DIR"
+
+  if [[ -z ${GITHUB_TOKEN:-} ]]; then
+    kz_info \
+      "GitHub token not set — $KZ_SRC_DIR will not sync (set GITHUB_TOKEN to enable)" \
+      "Token GitHub belum diatur — $KZ_SRC_DIR tidak akan disinkronkan (isi GITHUB_TOKEN untuk mengaktifkan)"
+    return 0
+  fi
+
+  # A sync failure (bad token, GitHub outage…) must never block SSH access.
+  local repo
+  if repo="$("$SYNC_BIN" --init)"; then
+    "$SYNC_BIN" --restore || kz_warn "Restore failed — continuing" "Restore gagal — melanjutkan"
+    kz_info \
+      "src sync ON — $KZ_SRC_DIR ⇄ private GitHub repo: $repo" \
+      "Sinkronisasi src AKTIF — $KZ_SRC_DIR ⇄ repo GitHub privat: $repo"
+    nohup "$SYNC_BIN" --watch >>"$SYNC_LOG" 2>&1 &
+  else
+    kz_warn \
+      "Could not link the GitHub repo — src sync disabled for this run" \
+      "Gagal menghubungkan repo GitHub — sinkronisasi src dinonaktifkan untuk sesi ini"
+  fi
+}
+
+# ---------------------------------------------------------------
+# 8. sshd
+# ---------------------------------------------------------------
+start_sshd() {
+  kz_info "Starting SSH server..." "Menjalankan server SSH..."
+  ssh-keygen -A >/dev/null 2>&1 || true # generate missing host keys (idempotent)
+  install -d -m 0755 /run/sshd
+  # Secrets are no longer needed in the environment of the long-lived process.
+  unset ROOT_PASSWORD SSH_PASSWORD AUTHORIZED_KEYS TAILSCALE_AUTHKEY
+  exec "$SSHD_BIN" -D -e
+}
+
+main() {
+  configure_root_password
+  record_deploy_time
+  configure_extra_user
+  configure_authorized_keys
+  persist_runtime_config
+  if [[ -n ${TAILSCALE_AUTHKEY:-} ]]; then
+    start_tailscale "$TAILSCALE_AUTHKEY" &
+  else
+    kz_info "Tailscale not set (optional)" "Tailscale tidak diatur (opsional)"
+  fi
+  start_src_sync
+  start_sshd
+}
+
+main "$@"
