@@ -1,0 +1,99 @@
+{
+  "name": "Kazama · Railway Ubuntu SSH",
+  "description": "Ubuntu 26.04 LTS SSH server with root access and a full developer toolkit. Connect over SSH as root. Bilingual (English / Bahasa Indonesia) cloud workstation with optional GitHub auto-backup of /root/src.",
+  "readme": "# Kazama — Railway Ubuntu SSH\n\nYour own cloud workstation on Railway. SSH in as **root** on Ubuntu 26.04.\n\n## Deploy\n1. Set a **ROOT_PASSWORD** (required) in the Variables tab.\n2. The template opens a **TCP Proxy** on port `22` automatically.\n3. Redeploy, then connect:\n\n```bash\nssh root@<your-railway-domain> -p <port>\n```\n\n## Variables\n- `ROOT_PASSWORD` (required) — root password\n- `SSH_USERNAME` / `SSH_PASSWORD` (optional) — secondary sudo user\n- `AUTHORIZED_KEYS` (optional) — SSH public key(s) for root\n- `TAILSCALE_AUTHKEY` (optional) — private SSH over Tailscale, no public TCP Proxy needed\n- `GITHUB_TOKEN` (optional) — auto-backup `/root/src` to a private `kazama-src-<id>` repo, restored on every redeploy\n- `SYNC_INTERVAL` (optional, default `180`) — sync interval in seconds\n- `RAILWAY_TOKEN` (optional) — account token for live credit in `usage`\n- `APP_LANG` (optional, default `en`) — `en` or `id`\n\nGuide to creating the GitHub token: see `docs/TOKENS.md` in the repo.\n\n© Kazama · Maintained by @kazamaofficial-git",
+  "services": [
+    {
+      "name": "kazama-ssh",
+      "source": {
+        "repo": "https://github.com/kazamaofficial-git/railway-ubuntu-ssh",
+        "branch": "main"
+      },
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile",
+        "watchPatterns": [
+          "Dockerfile",
+          "rootfs/**"
+        ]
+      },
+      "deploy": {
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 10
+      },
+      "networking": {
+        "restricted": false
+      },
+      "variables": {
+        "ROOT_PASSWORD": {
+          "required": true,
+          "secret": true,
+          "description": "Mandatory password for the root user. The container refuses to start without it. Change it after first login."
+        },
+        "SSH_USERNAME": {
+          "required": false,
+          "secret": false,
+          "description": "Optional secondary sudo user. Must be set together with SSH_PASSWORD."
+        },
+        "SSH_PASSWORD": {
+          "required": false,
+          "secret": true,
+          "description": "Password for the optional sudo user. Set together with SSH_USERNAME."
+        },
+        "AUTHORIZED_KEYS": {
+          "required": false,
+          "secret": true,
+          "description": "SSH public key(s) for root key-based authentication. Password login stays enabled."
+        },
+        "GITHUB_TOKEN": {
+          "required": false,
+          "secret": true,
+          "description": "GitHub token with 'repo' scope. When set, /root/src is backed up to a PRIVATE repo named kazama-src-<id> and restored on every redeploy."
+        },
+        "SYNC_INTERVAL": {
+          "required": false,
+          "secret": false,
+          "defaultValue": "180",
+          "description": "Seconds between automatic /root/src syncs (min 30; only used when GITHUB_TOKEN is set)."
+        },
+        "SRC_REPO": {
+          "required": false,
+          "secret": false,
+          "description": "Optional: pin the backup repository name (e.g. to restore into a new Railway project)."
+        },
+        "RAILWAY_TOKEN": {
+          "required": false,
+          "secret": true,
+          "description": "Optional Railway account token — lets the 'usage' command read your real remaining credit."
+        },
+        "APP_LANG": {
+          "required": false,
+          "secret": false,
+          "defaultValue": "en",
+          "description": "Runtime message language: en (English) or id (Bahasa Indonesia)."
+        },
+        "TAILSCALE_AUTHKEY": {
+          "required": false,
+          "secret": true,
+          "description": "Optional Tailscale auth key (reusable + ephemeral recommended). Enables private SSH over your tailnet — no public TCP Proxy needed. Tailscale must run on the device you connect from."
+        },
+        "TAILSCALE_HOSTNAME": {
+          "required": false,
+          "secret": false,
+          "defaultValue": "kazama-ssh",
+          "description": "Machine name shown in your Tailscale admin."
+        }
+      }
+    }
+  ],
+  "proxy": {
+    "application": "kazama-ssh",
+    "ports": [
+      {
+        "port": 22,
+        "protocol": "tcp",
+        "service": "kazama-ssh"
+      }
+    ]
+  }
+}
